@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/
+data/before/*
+data/after/**/*
+data/logs_jsonl/*
+data/logs_excel/*
+data/working_state/*
+data/reports/*
+!data/**/.gitkeep
+
