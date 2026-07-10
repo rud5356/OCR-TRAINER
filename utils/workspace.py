@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-from .block_parser import classify_block, parse_blocks
+from .block_parser import classify_block
 from .diff_utils import unified_diff
 from .document_segmenter import detect_boundary_candidates, split_text_at_boundaries, suggested_boundaries
 from .id_utils import make_block_id, make_document_id, utc_now
@@ -17,6 +17,37 @@ def active_blocks(document: dict) -> list[dict]:
 
 def document_text(document: dict) -> str:
     return "\n\n".join(block["text"] for block in active_blocks(document)).strip()
+
+
+def _plain_document(text: str, filename: str = "") -> dict:
+    """Create one document with one block that contains the original TXT as-is.
+
+    The first version split OCR text into document/block candidates.  The user
+    asked for the simpler mental model: BEFORE 원본 전체 = AFTER 편집 대상 전체.
+    Keeping it as one document/one block preserves the existing log/export
+    pipeline while removing the confusing split workflow from the screen.
+    """
+    document_id = make_document_id(1)
+    title = Path(filename).stem if filename else "원본 전체"
+    return {
+        "document_id": document_id,
+        "title": title or "원본 전체",
+        "doc_type": "plain_text",
+        "start_line": 1,
+        "end_line": len(text.splitlines()),
+        "blocks": [
+            {
+                "block_id": make_block_id(document_id),
+                "original_text": text,
+                "text": text,
+                "original_order": 0,
+                "current_order": 0,
+                "block_type": classify_block(text),
+                "modified": False,
+                "deleted": False,
+            }
+        ],
+    }
 
 
 def find_document(state: dict, document_id: str) -> dict:
@@ -50,40 +81,58 @@ def _commit(data_dir: Path, state: dict, record: dict) -> dict:
 
 def build_initial_state(upload: dict) -> dict:
     text = upload["text"]
-    candidates = detect_boundary_candidates(text)
-    chunks = split_text_at_boundaries(text, suggested_boundaries(text, candidates))
-    if not chunks:
+    if not text.strip():
         raise ValueError("TXT에서 문서를 생성할 수 없습니다.")
-    documents, originals = [], {}
-    for index, chunk in enumerate(chunks, start=1):
-        document_id = make_document_id(index)
-        title = next((line.strip() for line in chunk["text"].splitlines() if line.strip()), f"문서 {index}")[:100]
-        document = {
-            "document_id": document_id,
-            "title": title,
-            "doc_type": "unknown",
-            "start_line": chunk["start_line"],
-            "end_line": chunk["end_line"],
-            "blocks": parse_blocks(chunk["text"], document_id),
-        }
-        documents.append(document)
-        originals[document_id] = chunk["text"]
+    document = _plain_document(text, upload.get("filename", ""))
     now = utc_now()
     return {
         "schema_version": 1,
+        "plain_mode": True,
         "file_id": upload["file_id"],
         "filename": upload["filename"],
         "encoding": upload["encoding"],
         "before_path": upload["before_path"],
         "source_text": text,
-        "boundary_candidates": candidates,
-        "documents": documents,
-        "original_documents": originals,
+        "boundary_candidates": [],
+        "documents": [document],
+        "original_documents": {document["document_id"]: text},
         "history": [],
         "completed": False,
         "created_at": now,
         "updated_at": now,
     }
+
+
+def ensure_plain_state(data_dir: Path, state: dict) -> bool:
+    """Collapse older split states back to one BEFORE-shaped editable block.
+
+    This is intentionally conservative in scope: it only changes the working
+    state shape so the UI becomes simple.  Existing JSONL/Excel log files are not
+    deleted, and the source_text remains the immutable BEFORE original.
+    """
+    documents = state.get("documents") or []
+    already_plain = (
+        state.get("plain_mode")
+        and len(documents) == 1
+        and len(active_blocks(documents[0])) == 1
+    )
+    if already_plain:
+        return False
+
+    text = state.get("source_text") or ""
+    if not text.strip():
+        raise ValueError("BEFORE 원본 텍스트가 없어 단순 모드로 전환할 수 없습니다.")
+
+    document = _plain_document(text, state.get("filename", ""))
+    state["plain_mode"] = True
+    state["boundary_candidates"] = []
+    state["documents"] = [document]
+    state["original_documents"] = {document["document_id"]: text}
+    state["completed"] = False
+    state.pop("completed_at", None)
+    state["updated_at"] = utc_now()
+    save_state(data_dir, state)
+    return True
 
 
 def edit_document(data_dir: Path, state: dict, document_id: str, title: str, doc_type: str, user_id: str, memo: str = "") -> dict:

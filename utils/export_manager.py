@@ -31,10 +31,16 @@ def export_all(data_dir: Path, state: dict) -> dict[str, str]:
     document_pairs = []
     document_rows = []
     block_rows = []
+    plain_mode = bool(state.get("plain_mode"))
     for index, document in enumerate(state["documents"], start=1):
         after = document_text(document)
-        header = f"===== DOCUMENT {index:03d} | {document['title']} ====="
-        rendered_documents.append(f"{header}\n\n{after}")
+        # In plain mode the user wants the output to look exactly like the
+        # original TXT shape, so do not inject artificial document headers.
+        if plain_mode:
+            rendered_documents.append(after)
+        else:
+            header = f"===== DOCUMENT {index:03d} | {document['title']} ====="
+            rendered_documents.append(f"{header}\n\n{after}")
         document_path = data_dir / "after" / "by_document" / file_id / f"{document['document_id']}_after.txt"
         atomic_write_text(document_path, after)
         doc_logs = [log for log in logs if log.get("document_id") == document["document_id"]]
