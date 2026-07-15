@@ -15,7 +15,7 @@ from utils.diff_utils import unified_diff
 from utils.export_manager import export_all
 from utils.plain_diff_logger import save_plain_after_and_logs, save_plain_revision_logs
 from utils.state_manager import list_states, load_state, save_state
-from utils.text_loader import TextLoadError, ingest_upload
+from utils.text_loader import TextLoadError, decode_text, ingest_upload
 from utils.workspace import active_blocks, build_initial_state, ensure_plain_state
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -253,15 +253,48 @@ def save_edited_logs(state: dict, full_logs: list[dict], edited_rows: list[dict]
     save_plain_revision_logs(DATA_DIR, state["file_id"], updated)
 
 
-def handle_uploaded_txt(upload) -> None:
-    """Load a TXT as soon as the user selects it.
+def apply_uploaded_after(state: dict, after_text: str, after_filename: str, after_encoding: str) -> None:
+    """Apply an uploaded AFTER file as the initial editable text.
+
+    BEFORE remains immutable in ``source_text``.  The uploaded AFTER is only the
+    current review target, so the user can still edit it in the same text area.
+    """
+    document = state["documents"][0]
+    block = active_blocks(document)[0]
+    block["text"] = after_text
+    block["modified"] = after_text != state.get("source_text", "")
+    block["after_upload_filename"] = after_filename
+    block["after_upload_encoding"] = after_encoding
+
+    # A newly supplied AFTER replaces the comparison target.  Any previous log
+    # rows were generated against older AFTER text, so keeping them would show
+    # stale/wrong matches until the next save.
+    state["history"] = []
+    state["completed"] = False
+    state.pop("completed_at", None)
+    state["after_upload"] = {
+        "filename": after_filename,
+        "encoding": after_encoding,
+    }
+
+
+def handle_uploaded_txt(before_upload, after_upload=None) -> None:
+    """Load BEFORE TXT, with an optional already-edited AFTER TXT.
 
     이전 화면은 파일 선택 후 별도 업로드 버튼을 눌러야 해서 "업로드가 안 된 것"
     처럼 보일 수 있었다. 여기서는 선택 즉시 처리하고, 같은 파일이 rerun 때마다
-    반복 처리되지 않도록 파일 내용 hash를 세션에 저장한다.
+    반복 처리되지 않도록 BEFORE/AFTER 파일 내용 hash를 세션에 저장한다.
     """
-    raw = upload.getvalue()
-    upload_signature = f"{upload.name}:{hashlib.sha1(raw).hexdigest()}"
+    before_raw = before_upload.getvalue()
+    before_signature = f"{before_upload.name}:{hashlib.sha1(before_raw).hexdigest()}"
+
+    after_raw = after_upload.getvalue() if after_upload is not None else None
+    after_signature = (
+        f"{after_upload.name}:{hashlib.sha1(after_raw).hexdigest()}"
+        if after_upload is not None and after_raw is not None
+        else "NO_AFTER"
+    )
+    upload_signature = f"before={before_signature}|after={after_signature}"
     active_file_id = (st.session_state.get("ocr_state") or {}).get("file_id")
     already_active = (
         st.session_state.get("last_upload_signature") == upload_signature
@@ -270,37 +303,65 @@ def handle_uploaded_txt(upload) -> None:
 
     force_reload = st.button("다시 불러오기", width="stretch")
     if already_active and not force_reload:
-        st.caption(f"업로드 완료: {upload.name}")
+        if after_upload is not None:
+            st.caption(f"업로드 완료: BEFORE {before_upload.name} / AFTER {after_upload.name}")
+        else:
+            st.caption(f"업로드 완료: BEFORE {before_upload.name} / AFTER 없음")
         return
 
     try:
-        result = ingest_upload(upload.name, raw, DATA_DIR)
+        result = ingest_upload(before_upload.name, before_raw, DATA_DIR)
+        after_info = None
+        if after_upload is not None and after_raw is not None:
+            after_text, after_encoding = decode_text(after_raw)
+            after_info = {
+                "text": after_text,
+                "filename": after_upload.name,
+                "encoding": after_encoding,
+            }
+
         existing = DATA_DIR / "working_state" / f"{result['file_id']}_state.json"
         if existing.exists():
             refresh_state(result["file_id"])
-            st.info("기존 작업을 불러왔습니다.")
+            state = st.session_state.ocr_state
+            if after_info is not None:
+                apply_uploaded_after(state, after_info["text"], after_info["filename"], after_info["encoding"])
+                save_state(DATA_DIR, state)
+                save_plain_revision_logs(DATA_DIR, state["file_id"], [])
+                st.session_state.pop(f"after_editor_{state['file_id']}", None)
+                st.info("기존 BEFORE 작업에 업로드한 AFTER를 적용했습니다.")
+            else:
+                st.info("기존 작업을 불러왔습니다.")
         else:
             state = build_initial_state(result)
+            if after_info is not None:
+                apply_uploaded_after(state, after_info["text"], after_info["filename"], after_info["encoding"])
             save_state(DATA_DIR, state)
             st.session_state.ocr_state = state
 
         st.session_state.last_upload_signature = upload_signature
         st.session_state.last_uploaded_file_id = result["file_id"]
         st.session_state.export_paths = {}
-        st.success(f"TXT 업로드 완료: {upload.name}")
+        if after_info is not None:
+            st.success(f"TXT 업로드 완료: BEFORE {before_upload.name} / AFTER {after_info['filename']}")
+        else:
+            st.success(f"TXT 업로드 완료: BEFORE {before_upload.name} / AFTER는 BEFORE 원문으로 시작")
         st.rerun()
     except (TextLoadError, ValueError, OSError) as exc:
         st.error(f"TXT 업로드 실패: {exc}")
 
 
 st.title("OCR TXT 단순 오타 검수")
-st.caption("BEFORE 원본을 그대로 AFTER에 넣어두고, 오타·줄바꿈·글자 이동 같은 단순 수정 로그만 찍습니다.")
+st.caption("BEFORE 원본과 선택 AFTER를 비교합니다. AFTER를 올리지 않으면 BEFORE 원본을 그대로 편집 대상으로 시작합니다.")
 
 top_upload, top_select, top_user, top_finish, top_shutdown = st.columns([2.1, 2.1, 1.1, 1.2, 1.0])
 with top_upload:
-    upload = st.file_uploader("TXT 파일 선택", type=["txt"], accept_multiple_files=False)
-    if upload is not None:
-        handle_uploaded_txt(upload)
+    before_upload = st.file_uploader("BEFORE TXT 파일 선택", type=["txt"], accept_multiple_files=False, key="before_txt_upload")
+    after_upload = st.file_uploader("AFTER TXT 파일 선택 (선택)", type=["txt"], accept_multiple_files=False, key="after_txt_upload")
+    if before_upload is not None:
+        handle_uploaded_txt(before_upload, after_upload)
+    elif after_upload is not None:
+        st.caption("AFTER만으로는 작업을 만들 수 없습니다. BEFORE TXT를 함께 선택하세요.")
 
 choices = state_choices()
 with top_select:
